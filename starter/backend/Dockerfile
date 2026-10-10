@@ -4,8 +4,7 @@ WORKDIR /app
 
 COPY Pipfile /app/
 
-RUN pip install pipenv && \
-    pipenv install --system
+RUN pip install pipenv && pipenv install --system --skip-lock
 
 COPY . /app
 
