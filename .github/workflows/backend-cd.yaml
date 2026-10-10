@@ -9,12 +9,46 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        working-directory: ./starter/backend
+        run: |
+          pip install pipenv flake8
+          pipenv install --dev
+      - name: Lint
+        working-directory: ./starter/backend
+        run: pipenv run flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        working-directory: ./starter/backend
+        run: |
+          pip install pipenv
+          pipenv install --dev
+      - name: Test
+        working-directory: ./starter/backend
+        run: pipenv run pytest -v
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
       - name: Configure AWS credentials
-        continue-on-error: true
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -22,31 +56,24 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ secrets.AWS_REGION }}
       - name: Login to Amazon ECR
-        continue-on-error: true
         run: |
-          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com || true
-      - name: Build Docker image
-        continue-on-error: true
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+      - name: Build and Push Docker image
         working-directory: ./starter/backend
         run: |
-          docker build -t backend:latest . || true
-      - name: Tag Docker image
-        continue-on-error: true
+          docker build -t backend:latest .
+          docker tag backend:latest ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/backend:${{ github.sha }}
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/backend:${{ github.sha }}
+      - name: Verify Backend ECR image
         run: |
-          docker tag backend:latest ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/backend:${{ github.sha }} || true
-      - name: Push Docker image
-        continue-on-error: true
-        run: |
-          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/backend:${{ github.sha }} || true
+          aws ecr describe-images --repository-name backend --region ${{ secrets.AWS_REGION }}
 
   deploy:
     runs-on: ubuntu-latest
     needs: build
-    if: always()
     steps:
       - uses: actions/checkout@v4
       - name: Configure AWS credentials
-        continue-on-error: true
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -54,25 +81,14 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ secrets.AWS_REGION }}
       - name: Configure kubectl
-        continue-on-error: true
         run: |
-          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }} || echo "cluster check"
-      - name: Deploy backend
-        continue-on-error: true
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
+      - name: Deploy to EKS
         working-directory: ./starter/backend/k8s
         run: |
-          kustomize edit set image backend=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/backend:${{ github.sha }} || true
-          kustomize build | kubectl apply -f - || true
-      - name: Verify Kubernetes deployment
-        continue-on-error: true
-        run: |
-          kubectl rollout status deployment/backend --timeout=30s || true
-          echo "----- kubectl get all -----"
-          kubectl get all || echo "mock: backend pod running"
-          echo "----- kubectl describe deploy -----"
-          kubectl describe deploy backend || echo "mock describe"
-      - name: Verify Backend ECR image
-        continue-on-error: true
-        run: |
-          echo "------ Backend ECR Image Details ------"
-          AWS_PAGER="" aws ecr describe-images --repository-name backend --region us-east-1 || echo "mock ecr images"
+          kustomize edit set image backend=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/backend:${{ github.sha }}
+          kustomize build | kubectl apply -f -
+          kubectl rollout status deployment/backend
+          kubectl get all
+          kubectl describe deploy backend
+          kubectl get svc backend -o wide
